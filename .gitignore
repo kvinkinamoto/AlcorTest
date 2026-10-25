@@ -1,0 +1,3 @@
+# Project exclude paths
+/laravel-nexus/storage/app/
+/laravel-nexus/storage/framework/

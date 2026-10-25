@@ -1,0 +1,242 @@
+<?php
+
+declare(strict_types=1);
+
+use Alcor\Payroll\Audit\Application\Query\GetAudit;
+use Alcor\Payroll\Audit\Application\Query\GetLine;
+use Alcor\Payroll\Audit\Application\ReadModel\AuditReport;
+use Alcor\Payroll\Earning\Application\Command\AddAdjustment;
+use Alcor\Payroll\Earning\Application\Command\CalculateEarningLine;
+use Alcor\Payroll\MySqlSchema;
+use Alcor\Payroll\PayrollApp;
+use Alcor\Payroll\SharedKernel\Money;
+use Alcor\Payroll\SharedKernel\Period;
+use Alcor\Payroll\SteppingClock;
+use Alcor\Payroll\SystemClock;
+use Alcor\Payroll\Workforce\Application\Command\ChangeSourceData;
+use Alcor\Payroll\Workforce\Application\Command\HireEmployee;
+use Alcor\Payroll\Workforce\Application\Query\GetEmployee;
+use Alcor\Payroll\Workforce\Application\Query\ListEmployees;
+
+$boot = require __DIR__ . '/../bootstrap.php';
+/** @var PayrollApp $app */
+$app = $boot['app'];
+$commands = $app->commands;
+$queries = $app->queries;
+
+$positional = [];
+$options = [];
+foreach (array_slice($argv, 1) as $arg) {
+    if (str_starts_with($arg, '--')) {
+        [$key, $value] = array_pad(explode('=', substr($arg, 2), 2), 2, true);
+        $options[$key] = $value;
+    } else {
+        $positional[] = $arg;
+    }
+}
+$command = array_shift($positional) ?? 'help';
+
+function parseDate(mixed $value, bool $endOfDay): ?DateTimeImmutable
+{
+    if (!is_string($value)) {
+        return null;
+    }
+    $date = new DateTimeImmutable($value);
+
+    return ($endOfDay && strlen($value) === 10) ? $date->setTime(23, 59, 59) : $date;
+}
+
+function printAudit(AuditReport $report): void
+{
+    $window = ($report->from || $report->to)
+        ? sprintf('%s .. %s', $report->from?->format('Y-m-d') ?? 'beginning', $report->to?->format('Y-m-d') ?? 'now')
+        : 'full history';
+    printf("Audit: %s (%s) — %s\n", $report->employeeName, $report->employeeId, $window);
+
+    if ($report->sections === []) {
+        echo "No entries.\n";
+
+        return;
+    }
+
+    foreach ($report->sections as $s) {
+        printf("\nPeriod %s%s\n", $s->period, $s->frozen ? '  [frozen by manual adjustments]' : '');
+        if ($s->opening !== null) {
+            printf("  %-19s %-30s %12s %12s\n", '', 'Opening balance', '', $s->opening->format());
+        }
+        foreach ($s->entries as $e) {
+            printf(
+                "  %-19s %-30s %12s %12s  %s%s\n",
+                $e->at->format('Y-m-d H:i:s'),
+                $e->label(),
+                $e->amount->format($e->adjustmentNo !== null),
+                $e->runningTotal->format(),
+                $e->actor ? "[{$e->actor}] " : '',
+                $e->comment ?? '',
+            );
+        }
+        printf("  Current value: %s   (system value %s)\n", $s->currentValue->format(), $s->systemValue->format());
+    }
+}
+
+/** Replays the table from the assignment on in-memory adapters and prints every step. */
+function runScenario(): void
+{
+    $app = PayrollApp::inMemory(new SystemClock());
+    $period = Period::parse(date('Y-m'));
+    $app->commands->dispatch(new HireEmployee('demo', 'Demo employee', '1000'));
+    $step = static fn (string $event) => printf("%-62s => %s\n", $event, $app->queries->ask(new GetLine('demo', $period))->currentValue->format());
+    $adjust = static fn (string $amount, string $comment) => $app->commands->dispatch(new AddAdjustment('demo', $period, Money::parse($amount), $comment, 'olena'));
+
+    $app->commands->dispatch(new CalculateEarningLine('demo', $period));
+    $step('1. System calculates the line');
+    $app->commands->dispatch(new ChangeSourceData('demo', baseSalary: '1050'));
+    $app->commands->dispatch(new CalculateEarningLine('demo', $period));
+    $step('2. Source data changes, system recalculates');
+    $adjust('-45.55', 'Employee declined dental benefit; reversing deduction');
+    $step('3. Specialist adds -45.55');
+    $app->commands->dispatch(new ChangeSourceData('demo', baseSalary: '1300'));
+    $outcome = $app->commands->dispatch(new CalculateEarningLine('demo', $period));
+    $step("4. Source data changes again, recalculation {$outcome->value}");
+    $adjust('100.10', 'Late correction: missed approved overtime bonus');
+    $step('5. Specialist adds +100.10');
+    $adjust('-0.10', 'Minor rounding adjustment');
+    $step('6. Specialist adds -0.10');
+    $adjust('-0.20', 'Second minor rounding adjustment');
+    $step('7. Specialist adds -0.20');
+    $adjust('0.20', 'Correcting mistake in adjustment #4');
+    $step('8. Specialist adds +0.20 (compensating)');
+    echo "\n";
+    printAudit($app->queries->ask(new GetAudit('demo')));
+}
+
+try {
+    switch ($command) {
+        case 'migrate':
+            MySqlSchema::dropLegacy($boot['pdo']);
+            MySqlSchema::install($boot['pdo']);
+            echo "Schema ready.\n";
+            break;
+
+        case 'seed': // employees, and the assignment table replayed for Anna (one step per day, ending today)
+            $seeding = PayrollApp::mysql($boot['pdo'], new SteppingClock(date('Y-m-d', strtotime('-11 days')) . ' 09:00:00'));
+            $period = Period::parse(date('Y-m'));
+            $known = array_map(static fn ($e) => $e->id, $queries->ask(new ListEmployees()));
+            foreach ([['anna', 'Anna Koval', '1000'], ['bohdan', 'Bohdan Melnyk', '2400'], ['olena', 'Olena Shevchenko', '1850.50']] as [$id, $name, $base]) {
+                if (!in_array($id, $known, true)) {
+                    $commands->dispatch(new HireEmployee($id, $name, $base));
+                }
+            }
+            if ($queries->ask(new GetLine('anna', $period)) === null) {
+                $by = 'Olena (payroll specialist)';
+                $seeding->commands->dispatch(new CalculateEarningLine('anna', $period));
+                $seeding->commands->dispatch(new ChangeSourceData('anna', baseSalary: '1050'));
+                $seeding->commands->dispatch(new CalculateEarningLine('anna', $period));
+                $seeding->commands->dispatch(new AddAdjustment('anna', $period, Money::parse('-45.55'), 'Employee declined dental benefit; reversing deduction', $by));
+                $seeding->commands->dispatch(new ChangeSourceData('anna', baseSalary: '1300'));
+                $seeding->commands->dispatch(new CalculateEarningLine('anna', $period)); // ignored
+                $seeding->commands->dispatch(new AddAdjustment('anna', $period, Money::parse('100.10'), 'Late correction: missed approved overtime bonus', $by));
+                $seeding->commands->dispatch(new AddAdjustment('anna', $period, Money::parse('-0.10'), 'Minor rounding adjustment', $by));
+                $seeding->commands->dispatch(new AddAdjustment('anna', $period, Money::parse('-0.20'), 'Second minor rounding adjustment', $by));
+                $seeding->commands->dispatch(new AddAdjustment('anna', $period, Money::parse('0.20'), 'Correcting mistake in adjustment #4', $by));
+                foreach (['bohdan', 'olena'] as $id) {
+                    $seeding->commands->dispatch(new CalculateEarningLine($id, $period));
+                }
+            }
+            echo "Seeded: anna, bohdan, olena; Anna's line replays the assignment table ({$period}).\n";
+            break;
+
+        case 'employees':
+            foreach ($queries->ask(new ListEmployees()) as $e) {
+                printf("%-10s %-20s base %s  benefits -%s  bonus +%s\n", $e->id, $e->name, $e->baseSalary->format(), $e->benefitsDeduction->format(), $e->bonus->format());
+            }
+            break;
+
+        case 'set-source': // set-source <employee> [--base=] [--benefits=] [--bonus=]
+            $id = $positional[0] ?? throw new InvalidArgumentException('Usage: set-source <employee> [--base=] [--benefits=] [--bonus=]');
+            $commands->dispatch(new ChangeSourceData(
+                $id,
+                isset($options['base']) ? (string) $options['base'] : null,
+                isset($options['benefits']) ? (string) $options['benefits'] : null,
+                isset($options['bonus']) ? (string) $options['bonus'] : null,
+            ));
+            echo "Source data updated (takes effect on the next calculation).\n";
+            break;
+
+        case 'calculate': // calculate <employee> [YYYY-MM]
+            $id = $positional[0] ?? throw new InvalidArgumentException('Usage: calculate <employee> [YYYY-MM]');
+            $period = Period::parse($positional[1] ?? date('Y-m'));
+            $outcome = $commands->dispatch(new CalculateEarningLine($id, $period));
+            printf("%s. Current value: %s\n", $outcome->value, $queries->ask(new GetLine($id, $period))->currentValue->format());
+            break;
+
+        case 'adjust': // adjust <employee> <period> <amount> <comment> --actor= [--key=]
+            [$id, $period, $amount, $comment] = array_pad($positional, 4, '');
+            $currency = $queries->ask(new GetEmployee($id))->currency;
+            $period = Period::parse($period);
+            $number = $commands->dispatch(new AddAdjustment(
+                $id,
+                $period,
+                Money::parse($amount, $currency),
+                $comment,
+                (string) ($options['actor'] ?? throw new InvalidArgumentException('--actor is required')),
+                isset($options['key']) ? (string) $options['key'] : null,
+            ));
+            printf("Adjustment %d saved. Current value: %s\n", $number, $queries->ask(new GetLine($id, $period))->currentValue->format());
+            break;
+
+        case 'audit': // audit <employee> [--period=YYYY-MM] [--from=YYYY-MM-DD] [--to=YYYY-MM-DD] [--csv]
+            $report = $queries->ask(new GetAudit(
+                $positional[0] ?? throw new InvalidArgumentException('Usage: audit <employee> [--period=] [--from=] [--to=] [--csv]'),
+                parseDate($options['from'] ?? null, false),
+                parseDate($options['to'] ?? null, true),
+                isset($options['period']) ? Period::parse((string) $options['period']) : null,
+            ));
+            if (isset($options['csv'])) {
+                $rows = $report->rows();
+                $out = fopen('php://output', 'w');
+                fputcsv($out, array_keys($rows[0] ?? ['employee' => '']), escape: '');
+                foreach ($rows as $row) {
+                    fputcsv($out, $row, escape: '');
+                }
+            } else {
+                printAudit($report);
+            }
+            break;
+
+        case 'stream': // stream <employee> <period>: the raw stored events of one earning line
+            $stream = $app->eventStore->load(($positional[0] ?? '') . ':' . ($positional[1] ?? ''));
+            foreach ($stream as $i => $event) {
+                printf("%2d  %-26s %s  %s\n", $i + 1, (new ReflectionClass($event))->getShortName(), $event->occurredAt()->format('Y-m-d H:i:s'), json_encode($event->toPayload(), JSON_UNESCAPED_UNICODE));
+            }
+            break;
+
+        case 'rebuild': // drops the Audit read model and replays every stored event into it
+            printf("Replayed %d events.\n", $app->rebuildProjections());
+            break;
+
+        case 'scenario':
+            runScenario();
+            break;
+
+        default:
+            echo <<<TXT
+            Usage: php bin/payroll <command>
+
+              migrate                                   create/refresh MySQL tables (drops the tables of earlier versions)
+              seed                                      hire demo employees
+              employees                                 list employees and salary source data
+              set-source <emp> [--base= --benefits= --bonus=]
+              calculate <emp> [YYYY-MM]                 run the salary stub (created / recalculated / ignored)
+              adjust <emp> <YYYY-MM> <amount> "<comment>" --actor=<name> [--key=<idempotency key>]
+              audit <emp> [--period=YYYY-MM] [--from=YYYY-MM-DD] [--to=YYYY-MM-DD] [--csv]
+              stream <emp> <YYYY-MM>                    the stored event stream of one line
+              rebuild                                   rebuild the audit read model from the event store
+              scenario                                  replay the assignment table in memory (no database)
+
+            TXT;
+    }
+} catch (Throwable $e) {
+    fwrite(STDERR, 'Error: ' . $e->getMessage() . "\n");
+    exit(1);
+}
